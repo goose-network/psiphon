@@ -64,7 +64,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
@@ -106,6 +108,11 @@ type Provider struct {
 
 	watchCh chan struct{}
 	unsub   func() // notice hub unsubscribe
+
+	// lastListDownload is when the remote server list last landed in the
+	// datastore (unix nano; 0 = never), set by handleNotice and surfaced
+	// through Status.
+	lastListDownload atomic.Int64
 
 	closeOnce sync.Once
 }
@@ -252,7 +259,8 @@ func (p *Provider) establishTimeout() time.Duration {
 // handleNotice reacts to tunnel-core notices: tunnel establishment and
 // remote-server-list downloads both signal the engine to re-poll, so the
 // general outbound appears the moment the tunnel is up and the per-server
-// outbounds seconds after each list download.
+// outbounds seconds after each list download. The list download also
+// timestamps itself for Status.
 func (p *Provider) handleNotice(n notice) {
 	switch n.Type {
 	case "Tunnels":
@@ -260,6 +268,7 @@ func (p *Provider) handleNotice(n notice) {
 			p.signalWatch()
 		}
 	case "RemoteServerListResourceDownloaded":
+		p.lastListDownload.Store(time.Now().UnixNano())
 		p.signalWatch()
 	}
 }
@@ -317,6 +326,60 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 		})
 	}
 	return out, nil
+}
+
+// Status reports the provider's live self-assessment for the engine's
+// provider observability view (pub.StatusReporter): tunnel phase, server
+// list freshness, and which per-server tunnels are currently pinned up with
+// connections riding them.
+func (p *Provider) Status() pub.ProviderStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	details := map[string]any{
+		"data_dir":        p.dataDir,
+		"upstream_proxy":  p.cfg.UpstreamProxy != "",
+		"engine_stack":    p.stackDialer != nil && p.cfg.UpstreamProxy == "",
+		"servers_in_list": len(p.servers),
+	}
+
+	var phase, message string
+	switch {
+	case p.main == nil:
+		phase = "starting"
+		message = "tunnel not started"
+	case p.main.stopped():
+		phase = "stopped"
+	case p.main.established.Load():
+		phase = "running"
+	default:
+		phase = "establishing"
+		message = fmt.Sprintf("waiting for the general tunnel (timeout %s)", p.establishTimeout())
+	}
+
+	if ts := p.lastListDownload.Load(); ts > 0 {
+		details["last_list_download"] = time.Unix(0, ts).UTC().Format(time.RFC3339)
+	} else {
+		details["last_list_download"] = "never"
+	}
+
+	if len(p.pinned) > 0 {
+		pinned := make([]string, 0, len(p.pinned))
+		open := 0
+		for ip, st := range p.pinned {
+			pinned = append(pinned, ip)
+			open += int(st.open.Load())
+		}
+		sort.Strings(pinned)
+		details["pinned_tunnels"] = pinned
+		details["open_connections"] = open
+	}
+
+	return pub.ProviderStatus{
+		State:   phase,
+		Message: message,
+		Details: details,
+	}
 }
 
 // Close stops the provider: notice subscription and registry entry first

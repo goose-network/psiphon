@@ -328,3 +328,64 @@ func TestParseConfigDefaults(t *testing.T) {
 		t.Fatal("parseConfig must not mutate the caller's config map")
 	}
 }
+
+// TestStatusReport verifies the provider's self-assessment: phases from the
+// general tunnel's lifecycle, server-list bookkeeping, and the pinned-tunnel
+// summary — the fields the engine's provider status endpoint surfaces.
+func TestStatusReport(t *testing.T) {
+	p := &Provider{
+		cfg:      providerConfig{OutboundID: "psiphon", EstablishTimeoutSeconds: 30},
+		dataDir:  "/tmp/psiphon-status-test",
+		servers:  map[string]serverInfo{"1.2.3.4": {}, "5.6.7.8": {}},
+		pinned:   map[string]*serverTunnel{},
+		watchCh:  make(chan struct{}, 1),
+	}
+
+	st := p.Status()
+	if st.State != "starting" {
+		t.Errorf("nil-tunnel status state = %q, want %q", st.State, "starting")
+	}
+
+	p.main = &tunnelCore{}
+	st = p.Status()
+	if st.State != "establishing" {
+		t.Errorf("fresh-tunnel status state = %q, want %q", st.State, "establishing")
+	}
+	if st.Message == "" {
+		t.Error("establishing status should carry a message")
+	}
+
+	p.main.established.Store(true)
+	st = p.Status()
+	if st.State != "running" {
+		t.Errorf("established status state = %q, want %q", st.State, "running")
+	}
+	if st.Details["servers_in_list"] != 2 {
+		t.Errorf("servers_in_list = %v, want 2", st.Details["servers_in_list"])
+	}
+	if st.Details["last_list_download"] != "never" {
+		t.Errorf("last_list_download = %v, want \"never\"", st.Details["last_list_download"])
+	}
+	if _, ok := st.Details["pinned_tunnels"]; ok {
+		t.Error("pinned_tunnels present with none running")
+	}
+
+	// A pinned tunnel with an open connection is summarized.
+	stp := &serverTunnel{ip: "1.2.3.4"}
+	stp.open.Add(2)
+	p.pinned["1.2.3.4"] = stp
+	st = p.Status()
+	if pins, ok := st.Details["pinned_tunnels"].([]string); !ok || len(pins) != 1 || pins[0] != "1.2.3.4" {
+		t.Errorf("pinned_tunnels = %v, want [1.2.3.4]", st.Details["pinned_tunnels"])
+	}
+	if st.Details["open_connections"] != 2 {
+		t.Errorf("open_connections = %v, want 2", st.Details["open_connections"])
+	}
+
+	// A list download timestamps itself.
+	p.handleNotice(notice{Type: "RemoteServerListResourceDownloaded"})
+	st = p.Status()
+	if st.Details["last_list_download"] == "never" {
+		t.Error("last_list_download still \"never\" after a download notice")
+	}
+}

@@ -14,7 +14,7 @@ toolchain go1.26.8
 
 require (
 	github.com/Psiphon-Labs/psiphon-tunnel-core v0.0.0
-	github.com/goose-network/goose-plugin-api v0.0.0
+	github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5
 )
 
 require (
