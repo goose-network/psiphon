@@ -6,6 +6,18 @@
 // goose outbound. The engine merges that outbound into a managed pool, so any
 // goose inbound routed through the pool forwards traffic through Psiphon.
 //
+// # Zero-config operation
+//
+// With no config at all the provider still runs out of the box: it synthesizes
+// a psiphon.config carrying the production Psiphon network's propagation
+// channel, sponsor ID, remote server list URLs, and the RSA public key that
+// signs that list (extracted from the official Windows client and verified
+// against the live signed list). tunnel-core's background
+// RemoteServerListFetcher then downloads the signed server list, verifies it,
+// and populates the datastore — the provider needs no local server list or
+// config file, just network reachability to the list endpoints. A real
+// config_path still wins when supplied (self-hosted or custom networks).
+//
 // # Auto-updating server list
 //
 // tunnel-core's background RemoteServerListFetcher is left enabled (we do not
@@ -25,19 +37,20 @@
 //
 // # Config
 //
-// The provider config is a JSON object:
+// The provider config is a JSON object; every field is optional:
 //
 //	{
-//	  "config_path":      "/path/to/psiphon.config",
-//	  "server_list_path": "/path/to/server_list.dat",
-//	  "data_dir":         "/path/to/data-root",
+//	  "config_path":      "/path/to/psiphon.config", // optional; default embedded network config
+//	  "server_list_path": "/path/to/server_list.dat", // optional
+//	  "data_dir":         "/path/to/data-root",      // optional
 //	  "upstream_proxy":   "socks5://127.0.0.1:7890",  // optional
 //	  "establish_timeout_seconds": 120,                // optional
 //	  "outbound_id":      "psiphon"                    // optional, default "psiphon"
 //	}
 //
-// config_path and server_list_path are the real psiphon.config and
-// server_list.dat from a Psiphon install (see the demo for how to obtain them).
+// server_list_path is the real server_list.dat from a Psiphon install; with
+// the default config (or any config with remote server list URLs) it is
+// unnecessary — the fetcher retrieves and refreshes the list itself.
 package psiphon
 
 import (
@@ -58,28 +71,28 @@ type Provider struct {
 	cfg providerConfig
 
 	// tunnel state
-	mu      sync.Mutex
-	tunnel  *clientlib.PsiphonTunnel
+	mu        sync.Mutex
+	tunnel    *clientlib.PsiphonTunnel
 	socksPort int
-	ready   bool
+	ready     bool
 
 	// watch signals the engine that the outbound set may have changed
 	// (tunnel established, or server list refreshed).
 	watchCh chan struct{}
 
 	// stop cancels the tunnel start goroutine; stopWg waits for it.
-	stop     context.CancelFunc
-	stopWg   sync.WaitGroup
+	stop   context.CancelFunc
+	stopWg sync.WaitGroup
 }
 
 // providerConfig is the deserialized provider config map.
 type providerConfig struct {
-	ConfigPath                string `json:"config_path"`
-	ServerListPath            string `json:"server_list_path"`
-	DataDir                   string `json:"data_dir"`
-	UpstreamProxy             string `json:"upstream_proxy"`
-	EstablishTimeoutSeconds   int    `json:"establish_timeout_seconds"`
-	OutboundID                string `json:"outbound_id"`
+	ConfigPath              string `json:"config_path"`
+	ServerListPath          string `json:"server_list_path"`
+	DataDir                 string `json:"data_dir"`
+	UpstreamProxy           string `json:"upstream_proxy"`
+	EstablishTimeoutSeconds int    `json:"establish_timeout_seconds"`
+	OutboundID              string `json:"outbound_id"`
 }
 
 // New is the ProviderFactory registered as "psiphon". It parses the config
@@ -118,9 +131,8 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	if err := json.Unmarshal(raw, &pc); err != nil {
 		return providerConfig{}, fmt.Errorf("parse provider config: %w", err)
 	}
-	if pc.ConfigPath == "" {
-		return providerConfig{}, fmt.Errorf("psiphon provider: config_path is required")
-	}
+	// No config_path: run with the embedded production-network defaults (see
+	// defaults.go), which auto-retrieve the signed remote server list.
 	if pc.DataDir == "" {
 		pc.DataDir = filepath.Join(os.TempDir(), "goose-psiphon-data")
 	}
@@ -131,9 +143,17 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 // returns once the tunnel start attempt is underway (not once established);
 // the goroutine flips p.ready and signals Watch when establishment succeeds.
 func (p *Provider) startTunnel() error {
-	configJSON, err := os.ReadFile(p.cfg.ConfigPath)
-	if err != nil {
-		return fmt.Errorf("read config %s: %w", p.cfg.ConfigPath, err)
+	var configJSON []byte
+	var err error
+	if p.cfg.ConfigPath != "" {
+		configJSON, err = os.ReadFile(p.cfg.ConfigPath)
+		if err != nil {
+			return fmt.Errorf("read config %s: %w", p.cfg.ConfigPath, err)
+		}
+	} else {
+		// Zero-config: synthesize the production-network config so the
+		// remote-server-list fetcher can retrieve the server list itself.
+		configJSON = defaultConfigJSON()
 	}
 	configJSON, err = sanitizeConfig(configJSON, p.cfg.UpstreamProxy)
 	if err != nil {

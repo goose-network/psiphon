@@ -8,6 +8,28 @@ and exposes the tunnel's local SOCKS proxy as a single socks5 outbound that
 Goose merges into a managed pool. Any Goose inbound routed through that pool
 forwards traffic through Psiphon.
 
+## Zero-config (out of the box)
+
+The provider needs **no config at all**. With an empty `config` (or no
+`config_path`), it synthesizes a `psiphon.config` embedding the production
+Psiphon network parameters — propagation channel, sponsor ID, client version,
+the four remote-server-list endpoints (S3 + fronted fallbacks), the RSA key
+signing the list, and the ed25519 key signing handshake-discovered entries.
+tunnel-core's `RemoteServerListFetcher` then downloads the signed server
+list, verifies it, populates its datastore, and establishes a tunnel, exactly
+as the official Windows client does on first run. The values live in
+[`defaults.go`](defaults.go), extracted from the official `psiphon3.exe`; the
+signing key was verified cryptographically against the live production server
+list (`defaults_test.go` runs the synthesized config through tunnel-core's own
+`LoadConfig`+`Commit` validation).
+
+```json
+{ "providers": [ { "id": "psiphon", "provider": "psiphon" } ] }
+```
+
+is a complete, working config. A user-supplied `config_path` overrides the
+defaults (self-hosted / custom networks).
+
 ## Auto-updating server list
 
 tunnel-core's background `RemoteServerListFetcher` is left **enabled** (the
@@ -40,7 +62,7 @@ Goose's config:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `config_path` | yes | — | Path to a real `psiphon.config` from a Psiphon install. |
+| `config_path` | no | embedded production config | Path to a real `psiphon.config` from a Psiphon install. Omitted: the plugin runs with the embedded production-network defaults (see *Zero-config* above) and auto-retrieves the server list. |
 | `server_list_path` | no | — | Path to a `server_list.dat` to seed the datastore. If omitted, tunnel-core's remote fetcher populates it. |
 | `data_dir` | no | `$TMPDIR/goose-psiphon-data` | Data root for tunnel-core's datastore + diagnostics. |
 | `upstream_proxy` | no | — | Upstream proxy URL tunnel-core uses to reach Psiphon servers (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. |
@@ -94,6 +116,9 @@ See the [Goose README](../goose/README.md) for a full config. In short:
   ]
 }
 ```
+
+(The minimal form — `{"id": "psiphon", "provider": "psiphon"}` with no
+`config` — also works; see *Zero-config*.)
 
 Then route a request through Goose's SOCKS5 inbound:
 
