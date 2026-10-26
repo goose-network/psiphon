@@ -1,11 +1,11 @@
 // Module github.com/goose-network/goose-plugin-psiphon is the Psiphon outbound
 // provider plugin for the goose proxy-pool engine.
 //
-// It embeds Psiphon's tunnel-core as a Go library, starts a tunnel (with the
-// background remote-server-list fetcher enabled, so the server list
-// auto-updates just like the Psiphon Windows client), and exposes the tunnel's
-// local SOCKS proxy as a goose outbound that the engine merges into a managed
-// pool. See provider.go.
+// It embeds Psiphon's tunnel-core as a Go library, runs its controllers
+// directly — dials go in memory through controller.Dial, with the tunnels'
+// own connections routed through the engine's network stack — and emits one
+// general outbound plus one outbound per server in the auto-updated signed
+// remote server list. See provider.go.
 module github.com/goose-network/goose-plugin-psiphon
 
 go 1.26.0

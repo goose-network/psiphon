@@ -3,10 +3,31 @@
 A [Goose](../goose) outbound **provider** plugin backed by
 [Psiphon](https://github.com/Psiphon-Labs/psiphon-tunnel-core) tunnel-core.
 
-It embeds `psiphon-tunnel-core` as a Go library, starts a Psiphon tunnel,
-and exposes the tunnel's local SOCKS proxy as a single socks5 outbound that
-Goose merges into a managed pool. Any Goose inbound routed through that pool
-forwards traffic through Psiphon.
+It embeds `psiphon-tunnel-core` as a Go library, runs its controllers
+directly — with **no local SOCKS/HTTP proxy** in between — and exposes:
+
+- one **general** outbound (`psiphon`, any server — tunnel-core picks), and
+- one outbound **per real Psiphon server** from the auto-downloaded signed
+  server list (IP, region, protocols), each pinned to its own server.
+
+Goose merges all of them into a managed pool, so any inbound routed through
+the pool forwards traffic through Psiphon, and the web UI shows the actual
+server list.
+
+## In-memory dials, engine-stack transport
+
+The plugin registers the `"psiphon"` outbound protocol: its `DialContext`
+calls `controller.Dial` in process, returning the tunnel's `net.Conn`
+directly. The local SOCKS/HTTP proxies tunnel-core normally runs are
+disabled — there is no loopback hop between Goose and the tunnel.
+
+The tunnels' **own** TCP connections to their Psiphon servers dial through
+the engine's layer-3/4 stack (the system kernel stack or the gvisor
+netstack): the engine injects its stack dialer into the provider config
+(`goose-plugin-api`'s `StackDialer`), and the plugin hands it to tunnel-core
+via `Config.SetCustomDialer`. An explicit `upstream_proxy` overrides the
+stack for tunnel dials (tunnel-core applies `CustomDialer` in preference to
+`UpstreamProxyURL`, so both cannot be honored and the explicit route wins).
 
 ## Zero-config (out of the box)
 
@@ -32,18 +53,25 @@ defaults (self-hosted / custom networks).
 
 ## Auto-updating server list
 
-tunnel-core's background `RemoteServerListFetcher` is left **enabled** (the
-config's `DisableRemoteServerListFetcher` is not set), so the server list
-auto-updates the same way the Psiphon Windows client's does: the signed
-remote server list is downloaded, signature-verified, and new entries are
-stored in the BoltDB datastore. The provider signals `Watch()` when the
-tunnel first establishes and on each remote-list download, so Goose re-polls
-and the pool reflects the current state.
+tunnel-core's background `RemoteServerListFetcher` is left **enabled** for
+the general tunnel (the config's `DisableRemoteServerListFetcher` is not
+set), so the server list auto-updates the same way the Psiphon Windows
+client's does: the signed remote server list is downloaded,
+signature-verified, and new entries are stored in the BoltDB datastore.
 
-From Goose's perspective all Psiphon servers are reached through the single
-local SOCKS proxy that tunnel-core runs, so the provider emits one socks5
-outbound whose address is that local port. Per-server selection is owned by
-tunnel-core.
+The provider scans the datastore on each poll and emits one outbound per
+pinnable server (those supporting SSH API requests — what
+`Config.TargetServerEntry` requires), with IDs like
+`psiphon-203.0.113.7`. A notice hub fans tunnel-core's process-global
+notices to every provider instance, so `Watch()` fires on tunnel
+establishment and on each remote-list download seconds after it lands —
+the pool (and the web UI) follows the list without waiting for the periodic
+re-poll.
+
+A per-server dial lazily starts a controller pinned to that one server
+(`Config.TargetServerEntry`), shares it across concurrent connections, and
+reaps it after 10 idle minutes with no open connections. All controllers
+share one refcounted datastore.
 
 ## Import boundary
 
@@ -64,18 +92,17 @@ Goose's config:
 |-------|----------|---------|-------------|
 | `config_path` | no | embedded production config | Path to a real `psiphon.config` from a Psiphon install. Omitted: the plugin runs with the embedded production-network defaults (see *Zero-config* above) and auto-retrieves the server list. |
 | `server_list_path` | no | — | Path to a `server_list.dat` to seed the datastore. If omitted, tunnel-core's remote fetcher populates it. |
-| `data_dir` | no | `$TMPDIR/goose-psiphon-data` | Data root for tunnel-core's datastore + diagnostics. |
-| `upstream_proxy` | no | — | Upstream proxy URL tunnel-core uses to reach Psiphon servers (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. |
-| `establish_timeout_seconds` | no | `120` | Tunnel establishment timeout. |
-| `outbound_id` | no | `"psiphon"` | ID of the emitted socks5 outbound. |
+| `data_dir` | no | `psiphon-data` (working dir) | Data root for tunnel-core's datastore + diagnostics, anchored next to the engine's own state so the server list survives restarts. |
+| `upstream_proxy` | no | — | Upstream proxy URL tunnel-core uses to reach Psiphon servers (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. Overrides the engine stack for tunnel dials. |
+| `establish_timeout_seconds` | no | `120` | How long a dial waits for its tunnel to establish. |
+| `outbound_id` | no | `"psiphon"` | ID of the general outbound; per-server IDs are `<outbound_id>-<ip>`. Must be unique across providers — outbound configs use it to find the live provider at dial time. |
 
-`sanitizeConfig` strips host-specific fields from the Psiphon config
-(Windows `Migrate*` paths whose backslashes break the upgrade-file regex on
-Linux, and runtime-overridden fields like `LocalSocksProxyPort`,
-`DataRootDirectory`, `NetworkID`, `ClientPlatform`) and injects
-`UpstreamProxyURL`. It does **not** strip
-`DisableRemoteServerListFetcher`, so the background server-list fetcher
-stays enabled.
+`sanitizeConfig` strips host-specific and runtime-owned fields from the
+Psiphon config (Windows `Migrate*` paths whose backslashes break the
+upgrade-file regex on Linux, and the fields the plugin sets per controller:
+data root, local proxy ports, notice routing, timeouts, target server entry,
+…) and injects `UpstreamProxyURL`. An operator's
+`DisableRemoteServerListFetcher` is respected, not stripped.
 
 ## Build
 
@@ -130,12 +157,16 @@ The returned IP is a Psiphon exit, distinct from your direct IP.
 
 ## Caveats
 
-- **tunnel-core `connectedSignal` panic.** Upstream
-  `ClientLibrary/clientlib/clientlib.go` closed `connectedSignal` on every
-  `Tunnels {count>0}` notice without a guard; the second notice panicked
-  `close of closed channel` and crashed the embedding process. The local
-  tunnel-core checkout is patched with a `sync.Once` guard — keep that patch
-  or the integration will crash on the 2nd tunnel notice.
+- **Driving controllers directly.** The plugin does not use
+  `ClientLibrary/clientlib`: that path allows exactly one tunnel per process
+  (a `started` atomic) and closes its `connectedSignal` on the second
+  `Tunnels {count>0}` notice (the fork's branch is named after that panic).
+  Instead the plugin constructs `psiphon.Controller` itself — one general
+  controller plus one lazily-started pinned controller per dialed server —
+  over a single refcounted datastore. The fork carries the two seams this
+  needs: `Config.SetCustomDialer` (engine-stack transport) and
+  `Controller.HasActiveTunnel` (establishment polling, since process-global
+  notices cannot be attributed to a controller).
 - **Tunnel churn.** On restrictive networks/upstreams, tunnel-core tunnels
   may disconnect and re-establish every ~60s. Proxied fetches succeed only
   during a live-tunnel window; retry with backoff if a fetch returns empty.
