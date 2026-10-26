@@ -42,7 +42,10 @@
 //	{
 //	  "config_path":      "/path/to/psiphon.config", // optional; default embedded network config
 //	  "server_list_path": "/path/to/server_list.dat", // optional
-//	  "data_dir":         "/path/to/data-root",      // optional
+//	  "data_dir":         "/path/to/data-root",      // optional; default "psiphon-data"
+//	                                                  // next to the engine's state (the
+//	                                                  // working directory: /data in docker,
+//	                                                  // where goose.db lives locally)
 //	  "upstream_proxy":   "socks5://127.0.0.1:7890",  // optional
 //	  "establish_timeout_seconds": 120,                // optional
 //	  "outbound_id":      "psiphon"                    // optional, default "psiphon"
@@ -51,6 +54,15 @@
 // server_list_path is the real server_list.dat from a Psiphon install; with
 // the default config (or any config with remote server list URLs) it is
 // unnecessary — the fetcher retrieves and refreshes the list itself.
+//
+// # Fresh-deployment default
+//
+// This plugin is zero-config, so it also declares itself the engine's default
+// provider via pub.RegisterDefaultProvider: an engine started with no
+// providers configured (the docker image's no-config default) seeds a
+// psiphon provider and is routable out of the box. The engine does the
+// seeding generically from the registry declaration — it carries no
+// psiphon-specific code.
 package psiphon
 
 import (
@@ -134,7 +146,13 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 	// No config_path: run with the embedded production-network defaults (see
 	// defaults.go), which auto-retrieve the signed remote server list.
 	if pc.DataDir == "" {
-		pc.DataDir = filepath.Join(os.TempDir(), "goose-psiphon-data")
+		// Anchor the persisted datastore (server list, tunnel state) next to
+		// the engine's own state rather than /tmp: the working directory is
+		// /data on the docker volume and wherever the engine's goose.db lives
+		// locally, so the server list survives restarts and /tmp writability
+		// (e.g. distroless nonroot) is never a question. Made absolute at
+		// tunnel start, so a changing cwd mid-process cannot split state.
+		pc.DataDir = "psiphon-data"
 	}
 	return pc, nil
 }
@@ -346,10 +364,17 @@ func sanitizeConfig(raw []byte, upstreamProxy string) ([]byte, error) {
 	return out, nil
 }
 
-// init registers the provider factory with the goose plugin registry. Import
-// this package with a blank import in the engine binary to activate it:
+// init registers the provider factory with the goose plugin registry, and
+// declares the zero-config plugin as the fresh-deployment default provider.
+// Import this package with a blank import in the engine binary to activate
+// it:
 //
 //	import _ "github.com/goose-network/goose-plugin-psiphon"
 func init() {
 	pub.RegisterProvider("psiphon", New)
+	// Zero-config: this plugin runs on its embedded production-network
+	// defaults with an empty config map, so a fresh engine (no providers
+	// configured) seeds a psiphon provider. The engine does this generically
+	// from the registry declaration — nothing psiphon-specific lives there.
+	pub.RegisterDefaultProvider(pub.DefaultProvider{Provider: "psiphon"})
 }
