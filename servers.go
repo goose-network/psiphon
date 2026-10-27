@@ -42,6 +42,12 @@ const serverStartRetryInterval = 30 * time.Second
 // scanPinnableServers reads the datastore's current server entries and
 // returns the ones a pinned controller can use: those supporting SSH API
 // requests, which is what Config.TargetServerEntry requires.
+//
+// useUpstreamProxy filters the protocol listing to the direct-TCP protocols
+// that can ride a proxy — true when tunnel dials go through a raw proxy URL
+// OR an injected engine route (a goose outbound/pool/chain is a connected
+// TCP tunnel, the same constraint); the engine stack needs no filtering (it
+// is protocol-neutral layer 3/4).
 func scanPinnableServers(useUpstreamProxy bool) ([]serverInfo, error) {
 	var servers []serverInfo
 	err := psiphon.ScanServerEntries(func(entry *protocol.ServerEntry) bool {

@@ -42,11 +42,14 @@
 //	  "outbound_id":      "psiphon"                    // optional, default "psiphon"
 //	}
 //
-// upstream_proxy routes tunnel-core's connections (tunnel dials and list
-// fetches) through an explicit proxy URL. When set it overrides the engine
-// stack for tunnel dials: tunnel-core's CustomDialer takes precedence over
-// UpstreamProxyURL, so honoring both is impossible and the explicit route
-// wins.
+// upstream_proxy routes tunnel-core's connections (list fetches, and tunnel
+// dials when the engine injected no dialer of its own) through an explicit
+// proxy URL. The engine-injected dialers own tunnel dials first: the route
+// dialer injected when the provider spec's upstream_proxy names an engine
+// route (outbound:/pool:/chain:), else the engine stack — tunnel-core's
+// CustomDialer replaces the base dialer, so UpstreamProxyURL cannot reach
+// tunnel dials once either is set, but it keeps serving the untunneled list
+// fetches no custom dialer reaches.
 //
 // # Fresh-deployment default
 //
@@ -95,6 +98,12 @@ type Provider struct {
 	// pub.StackDialerKey; nil means tunnel-core dials directly.
 	stackDialer pub.StackDialer
 
+	// upstream is the engine's upstream-route dialer injected under
+	// pub.UpstreamDialerKey when the provider spec's upstream_proxy names a
+	// goose route (outbound:/pool:/chain:). Non-nil outranks stackDialer:
+	// the tunnels' connections to their Psiphon servers ride the route.
+	upstream pub.UpstreamDialer
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -141,6 +150,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		return nil, err
 	}
 	stackDialer := pub.AsStackDialer(cfg)
+	upstream := pub.AsUpstreamDialer(cfg)
 
 	var configJSON []byte
 	if pc.ConfigPath != "" {
@@ -169,6 +179,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		configJSON:  configJSON,
 		dataDir:     dataDir,
 		stackDialer: stackDialer,
+		upstream:    upstream,
 		ctx:         ctx,
 		cancel:      cancel,
 		servers:     map[string]serverInfo{},
@@ -183,7 +194,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		label:             pc.OutboundID,
 		dataRootDirectory: dataDir,
 		establishTimeout:  p.establishTimeout(),
-	}, stackDialer)
+	}, stackDialer, upstream)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("psiphon provider: %w", err)
@@ -284,7 +295,10 @@ func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 // the datastore. Per-server outbounds do not wait for the main tunnel — each
 // dials through its own lazily-started pinned controller.
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
-	servers, err := scanPinnableServers(p.cfg.UpstreamProxy != "")
+	// Tunnel dials ride a connected TCP tunnel when a raw upstream proxy URL
+	// or an injected engine route is configured, so list only the protocols
+	// that can (the engine stack is protocol-neutral and needs no filter).
+	servers, err := scanPinnableServers(p.cfg.UpstreamProxy != "" || p.upstream != nil)
 	if err != nil {
 		// Transient datastore trouble: keep the engine's existing pools; the
 		// next refresh signal retries.
@@ -337,9 +351,13 @@ func (p *Provider) Status() pub.ProviderStatus {
 	defer p.mu.Unlock()
 
 	details := map[string]any{
-		"data_dir":        p.dataDir,
-		"upstream_proxy":  p.cfg.UpstreamProxy != "",
-		"engine_stack":    p.stackDialer != nil && p.cfg.UpstreamProxy == "",
+		"data_dir":       p.dataDir,
+		"upstream_proxy": p.cfg.UpstreamProxy != "", // raw URL: untunneled fetches
+		"engine_route":   p.upstream != nil,         // tunnel dials ride it
+		// The stack carries tunnel dials only when no route outranks it; a
+		// raw upstream_proxy never reaches tunnel dials once a custom
+		// dialer is set (CustomDialer replaces tunnel-core's base dialer).
+		"engine_stack":    p.stackDialer != nil && p.upstream == nil,
 		"servers_in_list": len(p.servers),
 	}
 
@@ -486,7 +504,7 @@ func (p *Provider) tunnelForServer(st *serverTunnel) (*tunnelCore, error) {
 		dataRootDirectory: p.dataDir,
 		targetServerEntry: st.encoded,
 		establishTimeout:  p.establishTimeout(),
-	}, p.stackDialer)
+	}, p.stackDialer, p.upstream)
 	if err != nil {
 		st.startErr, st.startAt = err, time.Now()
 		return nil, err

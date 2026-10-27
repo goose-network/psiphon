@@ -2,6 +2,8 @@ package psiphon
 
 import (
 	"context"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +12,115 @@ import (
 
 	pub "github.com/goose-network/goose-plugin-api"
 )
+
+// dialRecorder is the shared recording core of the fake stack and route
+// dialers below: one entry per dial, "network address".
+type dialRecorder struct {
+	mu    sync.Mutex
+	dials []string
+}
+
+func (r *dialRecorder) record(network, address string) {
+	r.mu.Lock()
+	r.dials = append(r.dials, network+" "+address)
+	r.mu.Unlock()
+}
+
+func (r *dialRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string{}, r.dials...)
+}
+
+// fakeStackDialer is a pub.StackDialer answering Dial with a recorded pipe
+// conn.
+type fakeStackDialer struct{ rec *dialRecorder }
+
+func (f fakeStackDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	c1, c2 := net.Pipe()
+	go func() { <-ctx.Done(); _ = c2.Close() }()
+	return c1, nil
+}
+
+// fakeUpstreamDialer is a pub.UpstreamDialer answering DialUpstream with a
+// recorded pipe conn.
+type fakeUpstreamDialer struct{ rec *dialRecorder }
+
+func (f fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	c1, c2 := net.Pipe()
+	go func() { <-ctx.Done(); _ = c2.Close() }()
+	return c1, nil
+}
+
+// TestEngineCustomDialerPrecedence verifies the dialer choice newTunnelCore
+// hands tunnel-core's CustomDialer: an injected engine route (a goose
+// outbound/pool/chain) outranks the engine stack, the stack outranks
+// tunnel-core's kernel dialer, and the chosen dialer is called with the
+// dial arguments verbatim.
+func TestEngineCustomDialerPrecedence(t *testing.T) {
+	if d := engineCustomDialer(nil, nil); d != nil {
+		t.Fatal("engineCustomDialer(nil, nil) must be nil")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	d := engineCustomDialer(fakeStackDialer{stackRec}, fakeUpstreamDialer{routeRec})
+	conn, err := d(ctx, "tcp", "192.0.2.10:443")
+	if err != nil {
+		t.Fatalf("dial through the route: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 192.0.2.10:443" {
+		t.Fatalf("route dialed %v, want one tcp dial to the server", got)
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("stack dialed %v, want none — the route outranks the stack", got)
+	}
+
+	stackRec = &dialRecorder{}
+	d = engineCustomDialer(fakeStackDialer{stackRec}, nil)
+	if _, err := d(ctx, "tcp", "192.0.2.10:443"); err != nil {
+		t.Fatalf("dial through the stack: %v", err)
+	}
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 192.0.2.10:443" {
+		t.Fatalf("stack dialed %v, want one tcp dial to the server", got)
+	}
+}
+
+// TestStatusDialerDetails verifies the engine dialer bookkeeping in Status:
+// which of the raw upstream_proxy URL, the engine route, and the engine
+// stack carries which dial surface.
+func TestStatusDialerDetails(t *testing.T) {
+	p := &Provider{pinned: map[string]*serverTunnel{}}
+	check := func(want map[string]bool) {
+		t.Helper()
+		for k, v := range want {
+			if p.Status().Details[k] != v {
+				t.Fatalf("%s = %v, want %v (details %v)", k, p.Status().Details[k], v, p.Status().Details)
+			}
+		}
+	}
+
+	// Bare provider: nothing routed.
+	check(map[string]bool{"upstream_proxy": false, "engine_route": false, "engine_stack": false})
+
+	// Raw URL: untunneled list fetches ride it; tunnel dials stay on the
+	// kernel dialer.
+	p.cfg.UpstreamProxy = "socks5://127.0.0.1:7890"
+	check(map[string]bool{"upstream_proxy": true, "engine_route": false, "engine_stack": false})
+
+	// Engine stack injected: it carries tunnel dials.
+	p.stackDialer = fakeStackDialer{&dialRecorder{}}
+	check(map[string]bool{"engine_stack": true})
+
+	// Engine route injected: it carries tunnel dials; the stack does not.
+	p.upstream = fakeUpstreamDialer{&dialRecorder{}}
+	check(map[string]bool{"engine_route": true, "engine_stack": false})
+}
 
 // encodeTestEntry builds a syntactically valid encoded server entry for the
 // pinned-shape tests, the same encoding Config.TargetServerEntry consumes.
@@ -95,7 +206,7 @@ func TestNewTunnelCorePinnedShape(t *testing.T) {
 		dataRootDirectory: t.TempDir(),
 		targetServerEntry: encoded,
 		establishTimeout:  2 * time.Minute,
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("newTunnelCore(pinned): %v", err)
 	}
@@ -143,7 +254,7 @@ func TestNewTunnelCoreGeneralShape(t *testing.T) {
 		label:             "psiphon",
 		dataRootDirectory: t.TempDir(),
 		establishTimeout:  90 * time.Second,
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("newTunnelCore(general): %v", err)
 	}
@@ -334,11 +445,11 @@ func TestParseConfigDefaults(t *testing.T) {
 // summary — the fields the engine's provider status endpoint surfaces.
 func TestStatusReport(t *testing.T) {
 	p := &Provider{
-		cfg:      providerConfig{OutboundID: "psiphon", EstablishTimeoutSeconds: 30},
-		dataDir:  "/tmp/psiphon-status-test",
-		servers:  map[string]serverInfo{"1.2.3.4": {}, "5.6.7.8": {}},
-		pinned:   map[string]*serverTunnel{},
-		watchCh:  make(chan struct{}, 1),
+		cfg:     providerConfig{OutboundID: "psiphon", EstablishTimeoutSeconds: 30},
+		dataDir: "/tmp/psiphon-status-test",
+		servers: map[string]serverInfo{"1.2.3.4": {}, "5.6.7.8": {}},
+		pinned:  map[string]*serverTunnel{},
+		watchCh: make(chan struct{}, 1),
 	}
 
 	st := p.Status()

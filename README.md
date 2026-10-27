@@ -22,12 +22,21 @@ directly. The local SOCKS/HTTP proxies tunnel-core normally runs are
 disabled — there is no loopback hop between Goose and the tunnel.
 
 The tunnels' **own** TCP connections to their Psiphon servers dial through
-the engine's layer-3/4 stack (the system kernel stack or the gvisor
-netstack): the engine injects its stack dialer into the provider config
-(`goose-plugin-api`'s `StackDialer`), and the plugin hands it to tunnel-core
-via `Config.SetCustomDialer`. An explicit `upstream_proxy` overrides the
-stack for tunnel dials (tunnel-core applies `CustomDialer` in preference to
-`UpstreamProxyURL`, so both cannot be honored and the explicit route wins).
+the engine, not bare sockets: the engine injects its stack dialer into the
+provider config (`goose-plugin-api`'s `StackDialer`), and — when the
+provider spec's `upstream_proxy` names a goose route (`outbound:`/`pool:`/
+`chain:`) — the route dialer (`UpstreamDialer`), which outranks the stack.
+The plugin hands whichever it has to tunnel-core via
+`Config.SetCustomDialer`, so tunnel dials ride the engine route
+(an outbound/pool/chain whose own outermost hop rides the engine stack) or
+the engine's layer-3/4 stack (system kernel or gvisor netstack).
+
+A plugin-config `upstream_proxy` URL is untouched by this: a custom dialer
+replaces tunnel-core's base dialer, so the URL no longer reaches tunnel
+dials once the engine injects a dialer, but it keeps serving the untunneled
+dials no custom dialer reaches — the remote server list and upgrade
+downloads. The engine route thus composes with a raw proxy instead of
+silently discarding it.
 
 ## Zero-config (out of the box)
 
@@ -93,7 +102,7 @@ Goose's config:
 | `config_path` | no | embedded production config | Path to a real `psiphon.config` from a Psiphon install. Omitted: the plugin runs with the embedded production-network defaults (see *Zero-config* above) and auto-retrieves the server list. |
 | `server_list_path` | no | — | Path to a `server_list.dat` to seed the datastore. If omitted, tunnel-core's remote fetcher populates it. |
 | `data_dir` | no | `psiphon-data` (working dir) | Data root for tunnel-core's datastore + diagnostics, anchored next to the engine's own state so the server list survives restarts. |
-| `upstream_proxy` | no | — | Upstream proxy URL tunnel-core uses to reach Psiphon servers (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. Overrides the engine stack for tunnel dials. |
+| `upstream_proxy` | no | — | Raw upstream proxy URL tunnel-core uses (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. When the engine injects its route/stack dialer, the URL serves the untunneled list/upgrade fetches only (tunnel dials ride the engine dialer); otherwise it carries tunnel dials too. Prefer the spec-level `upstream_proxy` (a goose route) for the dials themselves. |
 | `establish_timeout_seconds` | no | `120` | How long a dial waits for its tunnel to establish. |
 | `outbound_id` | no | `"psiphon"` | ID of the general outbound; per-server IDs are `<outbound_id>-<ip>`. Must be unique across providers — outbound configs use it to find the live provider at dial time. |
 
